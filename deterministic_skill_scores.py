@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Deterministic skill score verification for NowPrecip ensemble members.
-Python equivalent of skill_scores_npc1.r
+Deterministic skill score verification for precipitation nowcasting ensemble members.
 
 Metrics (per lead time):
   PCORR, RMSF, CORR, POD, FAR, CSI, CMAE, CMSE, CRMSE, FSS_1, FSS_17, FSS_33
@@ -10,7 +9,7 @@ Output: one NetCDF file per timestamp x member.
 
 Usage:
     python deterministic_skill_scores.py \\
-        --run-dir /path/to/RUN5/NOWPRECIP.SIMULATIONS/ \\
+        --run-dir /path/to/RUN5/NOWCAST.SIMULATIONS/ \\
         --output-dir /path/to/output/ \\
         --csv /path/to/filtered_timestamps.csv \\
         [--threshold 0.1667] \\
@@ -245,7 +244,7 @@ def save_netcdf(scores, timestamp, member_index, output_dir, output_prefix, thre
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Deterministic skill score verification for NowPrecip ensemble members."
+        description="Deterministic skill score verification for precipitation nowcasting ensemble members."
     )
     parser.add_argument("--run-dir",    required=True,
                         help="Root directory containing MEMBER.00, MEMBER.01, ... subdirs")
