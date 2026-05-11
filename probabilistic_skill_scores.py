@@ -17,7 +17,7 @@ Usage:
         --run-dir /path/to/RUN5/NOWCAST.SIMULATIONS/ \
         --output-dir /path/to/output/ \
         --csv /path/to/filtered_timestamps.csv \
-        [--threshold 0.1667 (1/6)] \
+        [--threshold 0.1667 0.3333 0.8333 1.6667] \
         [--members 0 10] \
         [--prefix npc1.prob]
 """
@@ -245,25 +245,91 @@ def update_rank_histogram(rank_hist, obs, sim_ensemble):
 
 
 # ============================================================
+# STAGE 5: CRPS and tail-weighted CRPS
+# ============================================================
+
+def _crps_per_pixel(obs_vec, ens_mat):
+    """
+    obs_vec : (n_valid,)
+    ens_mat : (n_valid, n_members) — no NaNs, pre-filtered
+
+    Uses the sorted-member identity to avoid an O(m^2) pairwise tensor:
+        sum_{i,j} |x_i - x_j| = 2 * sum_k (2k - m - 1) * x_(k)  [k 1-indexed, sorted]
+    so  E|X-X'|/2 = (1/m^2) * sum_k (2k-m-1) * x_(k)
+    """
+    n_members   = ens_mat.shape[1]
+    term1       = np.mean(np.abs(ens_mat - obs_vec[:, None]), axis=1)
+    ens_sorted  = np.sort(ens_mat, axis=1)
+    k           = np.arange(1, n_members + 1, dtype=np.float64)
+    weights     = 2.0 * k - n_members - 1.0
+    term2       = ens_sorted @ weights / (n_members ** 2)
+    return term1 - term2
+
+
+def compute_crps(obs, sim_ensemble):
+    """
+    Standard ensemble CRPS averaged over valid pixels per lead time.
+    Returns (N_LEAD,).
+    """
+    n_members = sim_ensemble.shape[3]
+    crps_out  = np.full(N_LEAD, np.nan)
+    for t in range(N_LEAD):
+        obs_vec = obs[:, :, t].ravel()
+        ens_mat = sim_ensemble[:, :, t, :].reshape(-1, n_members)
+        valid   = ~np.isnan(obs_vec) & ~np.any(np.isnan(ens_mat), axis=1)
+        if not np.any(valid):
+            continue
+        crps_out[t] = np.mean(_crps_per_pixel(obs_vec[valid], ens_mat[valid]))
+    return crps_out
+
+
+def compute_tw_crps(obs, sim_ensemble, threshold):
+    """
+    Tail-weighted CRPS: CRPS applied to max(x-v, 0) and max(y-v, 0).
+    Scores only the part of the distribution above `threshold`, so large
+    errors in the upper tail are penalised more heavily than by standard CRPS.
+    Returns (N_LEAD,).
+    """
+    obs_c     = np.maximum(obs - threshold, 0.0)
+    ens_c     = np.maximum(sim_ensemble - threshold, 0.0)
+    n_members = sim_ensemble.shape[3]
+    tw_out    = np.full(N_LEAD, np.nan)
+    for t in range(N_LEAD):
+        obs_vec = obs_c[:, :, t].ravel()
+        ens_mat = ens_c[:, :, t, :].reshape(-1, n_members)
+        valid   = ~np.isnan(obs_vec) & ~np.any(np.isnan(ens_mat), axis=1)
+        if not np.any(valid):
+            continue
+        tw_out[t] = np.mean(_crps_per_pixel(obs_vec[valid], ens_mat[valid]))
+    return tw_out
+
+
+# ============================================================
 # NetCDF OUTPUT
 # ============================================================
 
-def save_netcdf(results, members, output_dir, prefix, threshold):
-    path   = os.path.join(output_dir, f"{prefix}.nc")
-    n_thr  = len(PROB_THRESHOLDS)
-    n_bins = len(members) + 1
+def save_netcdf(results, members, output_dir, prefix, thresholds):
+    path         = os.path.join(output_dir, f"{prefix}.nc")
+    n_prob_thr   = len(PROB_THRESHOLDS)
+    n_precip_thr = len(thresholds)
+    n_bins       = len(members) + 1
 
     with nc.Dataset(path, "w") as ds:
-        ds.createDimension("lead_time",      N_LEAD)
-        ds.createDimension("prob_threshold", n_thr)
-        ds.createDimension("rank_bin",       n_bins)
+        ds.createDimension("lead_time",        N_LEAD)
+        ds.createDimension("prob_threshold",   n_prob_thr)
+        ds.createDimension("precip_threshold", n_precip_thr)
+        ds.createDimension("rank_bin",         n_bins)
 
-        lt       = ds.createVariable("lead_time",      "i4", ("lead_time",))
+        lt       = ds.createVariable("lead_time", "i4", ("lead_time",))
         lt[:]    = np.arange(N_LEAD)
         lt.units = "5-minute steps from analysis time"
 
         pt    = ds.createVariable("prob_threshold", "f4", ("prob_threshold",))
         pt[:] = PROB_THRESHOLDS.astype(np.float32)
+
+        prt       = ds.createVariable("precip_threshold", "f4", ("precip_threshold",))
+        prt[:]    = np.array(thresholds, dtype=np.float32)
+        prt.units = "mm/10min"
 
         rb    = ds.createVariable("rank_bin", "i4", ("rank_bin",))
         rb[:] = np.arange(1, n_bins + 1)
@@ -274,19 +340,26 @@ def save_netcdf(results, members, output_dir, prefix, threshold):
             ("fbb0",   "Forecast frequency in probability bin"),
             ("orf",    "Observed relative frequency in probability bin"),
         ]:
-            v = ds.createVariable(name, "f4", ("prob_threshold", "lead_time"), fill_value=np.nan)
+            v = ds.createVariable(name, "f4", ("precip_threshold", "prob_threshold", "lead_time"), fill_value=np.nan)
             v[:] = results[name].astype(np.float32)
             v.long_name = long_name
 
-        bs           = ds.createVariable("brier_score", "f4", ("lead_time",), fill_value=np.nan)
+        bs           = ds.createVariable("brier_score", "f4", ("precip_threshold", "lead_time"), fill_value=np.nan)
         bs[:]        = results["brier"].astype(np.float32)
         bs.long_name = "Brier Score"
+
+        cr           = ds.createVariable("crps",    "f4", ("lead_time",), fill_value=np.nan)
+        cr[:]        = results["crps"].astype(np.float32)
+        cr.long_name = "Continuous Ranked Probability Score"
+
+        tw           = ds.createVariable("tw_crps", "f4", ("precip_threshold", "lead_time"), fill_value=np.nan)
+        tw[:]        = results["tw_crps"].astype(np.float32)
+        tw.long_name = "Tail-weighted CRPS (censored above precip_threshold)"
 
         rh           = ds.createVariable("rank_histogram", "i8", ("rank_bin", "lead_time"))
         rh[:]        = results["rank_hist"]
         rh.long_name = "Rank histogram counts (Talagrand diagram)"
 
-        ds.threshold    = threshold
         ds.n_members    = len(members)
         ds.n_timestamps = int(results["n_timestamps"])
         ds.inca_nx      = INCA_NX
@@ -309,8 +382,11 @@ def parse_args():
                         help="Directory where output NetCDF and stage1 cache are written")
     parser.add_argument("--csv",        required=True,
                         help="CSV with a 'Timestamps' column")
-    parser.add_argument("--threshold",  type=float, default=1/6,
-                        help="Precipitation threshold in mm/5min (default: 1/6 ≈ 10 mm/h)")
+    parser.add_argument("--threshold",  type=float, nargs="+",
+                        default=[1/6, 2/6, 5/6, 10/6],
+                        metavar="THR",
+                        help="One or more precipitation thresholds in mm/10min "
+                             "(default: 1/6, 2/6, 5/6, 10/6 → 1, 2, 5, 10 mm/hr)")
     parser.add_argument("--members",    type=int, nargs=2, default=[0, 10],
                         metavar=("FIRST", "LAST"),
                         help="Inclusive range of member indices (default: 0 10)")
@@ -326,7 +402,7 @@ if __name__ == "__main__":
     RUN_DIR    = args.run_dir
     OUTPUT_DIR = args.output_dir
     CSV_PATH   = args.csv
-    THRESHOLD  = args.threshold
+    THRESHOLDS = args.threshold
     MEMBERS    = list(range(args.members[0], args.members[1] + 1))
     PREFIX     = args.prefix
     STAGE1_DIR = args.stage1_dir or os.path.join(OUTPUT_DIR, "stage1")
@@ -337,22 +413,27 @@ if __name__ == "__main__":
     timestamps = pd.read_csv(CSV_PATH)["Timestamps"].astype(str).tolist()
     print(f"Loaded {len(timestamps)} timestamps from {CSV_PATH}\n")
 
-    n_thr  = len(PROB_THRESHOLDS)
-    n_bins = len(MEMBERS) + 1
+    n_prob_thr   = len(PROB_THRESHOLDS)
+    n_precip_thr = len(THRESHOLDS)
+    n_bins       = len(MEMBERS) + 1
 
-    # Accumulators (track per-cell counts to handle NaN)
-    hits_sum   = np.zeros((n_thr, N_LEAD))
-    nohits_sum = np.zeros((n_thr, N_LEAD))
-    fbb0_sum   = np.zeros((n_thr, N_LEAD))
-    orf_sum    = np.zeros((n_thr, N_LEAD))
-    brier_sum  = np.zeros(N_LEAD)
-    hits_cnt   = np.zeros((n_thr, N_LEAD), dtype=int)
-    nohits_cnt = np.zeros((n_thr, N_LEAD), dtype=int)
-    fbb0_cnt   = np.zeros((n_thr, N_LEAD), dtype=int)
-    orf_cnt    = np.zeros((n_thr, N_LEAD), dtype=int)
-    brier_cnt  = np.zeros(N_LEAD, dtype=int)
-    rank_hist  = np.zeros((n_bins, N_LEAD), dtype=np.int64)
-    n_valid    = 0
+    # Accumulators: leading axis is precipitation threshold index
+    hits_sum   = np.zeros((n_precip_thr, n_prob_thr, N_LEAD))
+    nohits_sum = np.zeros((n_precip_thr, n_prob_thr, N_LEAD))
+    fbb0_sum   = np.zeros((n_precip_thr, n_prob_thr, N_LEAD))
+    orf_sum    = np.zeros((n_precip_thr, n_prob_thr, N_LEAD))
+    brier_sum  = np.zeros((n_precip_thr, N_LEAD))
+    hits_cnt   = np.zeros((n_precip_thr, n_prob_thr, N_LEAD), dtype=int)
+    nohits_cnt = np.zeros((n_precip_thr, n_prob_thr, N_LEAD), dtype=int)
+    fbb0_cnt   = np.zeros((n_precip_thr, n_prob_thr, N_LEAD), dtype=int)
+    orf_cnt    = np.zeros((n_precip_thr, n_prob_thr, N_LEAD), dtype=int)
+    brier_cnt    = np.zeros((n_precip_thr, N_LEAD), dtype=int)
+    crps_sum     = np.zeros(N_LEAD)
+    crps_cnt     = np.zeros(N_LEAD, dtype=int)
+    tw_crps_sum  = np.zeros((n_precip_thr, N_LEAD))
+    tw_crps_cnt  = np.zeros((n_precip_thr, N_LEAD), dtype=int)
+    rank_hist    = np.zeros((n_bins, N_LEAD), dtype=np.int64)
+    n_valid      = 0
 
     for k, timestamp in enumerate(timestamps):
         print(f"[{k+1}/{len(timestamps)}] {timestamp}")
@@ -362,25 +443,35 @@ if __name__ == "__main__":
         if obs is None:
             continue
 
-        # Stage 2
-        obs_a, sim_prob = compute_exceedance(obs, sim_ensemble, THRESHOLD)
+        # Stage 5a: CRPS (threshold-independent)
+        crps_scores = compute_crps(obs, sim_ensemble)
+        m = ~np.isnan(crps_scores)
+        crps_sum[m] += crps_scores[m]
+        crps_cnt[m] += 1
 
-        # Stage 3
-        scores = contingency_and_brier(obs_a, sim_prob)
+        # Stages 2–3 + 5b: repeat for each precipitation threshold
+        for i, thr in enumerate(THRESHOLDS):
+            obs_a, sim_prob = compute_exceedance(obs, sim_ensemble, thr)
+            scores = contingency_and_brier(obs_a, sim_prob)
 
-        for name, s, c in [
-            ("hits",   hits_sum,   hits_cnt),
-            ("nohits", nohits_sum, nohits_cnt),
-            ("fbb0",   fbb0_sum,   fbb0_cnt),
-            ("orf",    orf_sum,    orf_cnt),
-        ]:
-            m = ~np.isnan(scores[name])
-            s[m] += scores[name][m]
-            c[m] += 1
+            for name, s, c in [
+                ("hits",   hits_sum,   hits_cnt),
+                ("nohits", nohits_sum, nohits_cnt),
+                ("fbb0",   fbb0_sum,   fbb0_cnt),
+                ("orf",    orf_sum,    orf_cnt),
+            ]:
+                m = ~np.isnan(scores[name])
+                s[i][m] += scores[name][m]
+                c[i][m] += 1
 
-        m = ~np.isnan(scores["brier"])
-        brier_sum[m] += scores["brier"][m]
-        brier_cnt[m] += 1
+            m = ~np.isnan(scores["brier"])
+            brier_sum[i][m] += scores["brier"][m]
+            brier_cnt[i][m] += 1
+
+            tw = compute_tw_crps(obs, sim_ensemble, thr)
+            m  = ~np.isnan(tw)
+            tw_crps_sum[i][m] += tw[m]
+            tw_crps_cnt[i][m] += 1
 
         # Stage 4
         rank_hist = update_rank_histogram(rank_hist, obs, sim_ensemble)
@@ -391,13 +482,15 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     results = dict(
-        hits      = np.where(hits_cnt   > 0, hits_sum   / hits_cnt,   np.nan),
-        nohits    = np.where(nohits_cnt > 0, nohits_sum / nohits_cnt, np.nan),
-        fbb0      = np.where(fbb0_cnt   > 0, fbb0_sum   / fbb0_cnt,   np.nan),
-        orf       = np.where(orf_cnt    > 0, orf_sum    / orf_cnt,    np.nan),
-        brier     = np.where(brier_cnt  > 0, brier_sum  / brier_cnt,  np.nan),
+        hits      = np.where(hits_cnt     > 0, hits_sum     / hits_cnt,     np.nan),
+        nohits    = np.where(nohits_cnt   > 0, nohits_sum   / nohits_cnt,   np.nan),
+        fbb0      = np.where(fbb0_cnt     > 0, fbb0_sum     / fbb0_cnt,     np.nan),
+        orf       = np.where(orf_cnt      > 0, orf_sum      / orf_cnt,      np.nan),
+        brier     = np.where(brier_cnt    > 0, brier_sum    / brier_cnt,    np.nan),
+        crps      = np.where(crps_cnt     > 0, crps_sum     / crps_cnt,     np.nan),
+        tw_crps   = np.where(tw_crps_cnt  > 0, tw_crps_sum  / tw_crps_cnt,  np.nan),
         rank_hist = rank_hist,
         n_timestamps = n_valid,
     )
 
-    save_netcdf(results, MEMBERS, OUTPUT_DIR, PREFIX, THRESHOLD)
+    save_netcdf(results, MEMBERS, OUTPUT_DIR, PREFIX, THRESHOLDS)
